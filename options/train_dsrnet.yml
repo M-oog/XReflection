@@ -1,7 +1,7 @@
 # general settings
-name: train_sirs_dsit_w_nature
+name: train_sirs_dsrnet
 is_train: true
-model_type: DSITModel  # Use DSIT Lightning module
+model_type: DSRNetModel  # Use Lightning module instead of vanilla model
 num_gpu: auto  # auto: can infer from your visible devices automatically
 manual_seed: 42
 
@@ -10,11 +10,11 @@ test_only: false          # Whether to only test the model
 precision: '32-true'      # Precision for training (32-true, 16-mixed, bf16-mixed)
 accelerator: 'auto'       # Accelerator type (auto, gpu, cpu)
 val_check_interval: 0.25   # Validation check interval
-log_every_n_steps: 10     # Log every n steps (more frequent for DSIT)
+log_every_n_steps: 10     # Log every n steps
 
 # Lightning specific settings
 lightning:
-  max_epochs: 100
+  max_epochs: 80
   gradient_clip_val: null
   accumulate_grad_batches: 1
   deterministic: true
@@ -24,7 +24,7 @@ lightning:
 
 # checkpoint settings
 checkpoint:
-  monitor: 'metrics/average/psnr'  # Monitor average PSNR across all validation datasets
+  monitor: 'metrics/average/psnr'  # 恢复到原来的val/psnr格式
   mode: 'max'  # 'max' for psnr, 'min' for loss
   save_top_k: 3
   save_last: true
@@ -33,43 +33,42 @@ checkpoint:
 datasets:
   train:
     name: general-dataset
-    type: DSITFusionDataset
-    size: 5000
+    type: DSRFusionDataset
+    size: 4000  # 对于w_nature
 
     fused_datasets:
-      - name: syn-dataset
-        ratio: 0.6  # 60% synthetic data as in original
-        type: DSRDataset
-        datadir: /opt/datasets/sirs/train/VOCdevkit/VOC2012/PNGImages
-        fns: /opt/datasets/sirs/train/VOC2012_224_train_png.txt
-        size: ~  # max_dataset_size, use ~ for unlimited
-        enable_transforms: True
-        transform_size: 384
-
       - name: real-dataset
-        ratio: 0.2  # 20% real data as in original
+        ratio: 0.2
         type: DSRTestDataset
         datadir: /opt/datasets/sirs/train/real
         enable_transforms: True
-        transform_size: 384
+        transform_size: 224
 
       - name: nature-dataset
-        ratio: 0.2  # 20% natural data as in original
+        ratio: 0.2
         type: DSRTestDataset
         datadir: /opt/datasets/sirs/train/nature
         enable_transforms: True
-        transform_size: 384
+        transform_size: 224
+
+      - name: syn-dataset
+        ratio: 0.6
+        type: DSRDataset
+        datadir: /opt/datasets/sirs/train/VOCdevkit/VOC2012/PNGImages
+        fns: /opt/datasets/sirs/train/VOC2012_224_train_png.txt
+        size: ~
+        enable_transforms: True
+        transform_size: 224
 
     io_backend:
       type: disk
 
     # data loader
     use_shuffle: true
-    num_worker_per_gpu: 8  # High number of workers as in original
-    batch_size_per_gpu: 1   # Batch size from original batchSize
+    num_worker_per_gpu: 4
+    batch_size_per_gpu: 1
     dataset_enlarge_ratio: 1
     prefetch_mode: ~
-    prefetch_factor: 32
 
   val_datasets:
     - name: Real20
@@ -134,18 +133,18 @@ datasets:
 
 # network structures
 network_g:
-  type: DSIT  # DSIT architecture
-  window_size: 12
-  enc_blk_nums: [ 12, 8, 4, 2, 2 ]
-  dec_blk_nums: [ 2, 2, 2, 2, 2 ]
-  pretrained_models:
-    swin_prior: swin_large_o365_finetune.pth
+  type: DSRNet
+  width: 64
+  middle_blk_num: 12
+  enc_blk_nums: [2,2,4,8]
+  dec_blk_nums: [2,2,2,2]
+  lrm_blk_nums: [2,4]
 
 # path
 path:
   pretrain_network_g: ~
   param_key_g: params
-  strict_load_g: True
+  strict_load_g: true
   resume_state: ~
   experiments_root: experiments  # Root directory for all experiments
   visualization: ~  # Will be set dynamically in main.py
@@ -161,7 +160,7 @@ train:
 
   scheduler:
     type: MultiStepLR
-    milestones: [ 100000000 ]
+    milestones: [150, 300, 450]
     gamma: 0.5
 
   # losses
@@ -170,27 +169,43 @@ train:
     losses: [nn.MSELoss(), GradientLoss()]
     weight: [0.3, 0.6]
 
-  # perceptual loss (VGG-based)
+  # reconstruction loss
+  recon_opt:
+    type: L1Loss
+    loss_weight: 0.2
+    reduction: mean
+
+  # perceptual loss (content and style losses)
   perceptual_opt:
-    type: DSITPerceptualLoss
-    loss_weight: !!float 1e-2
+    type: PerceptualLoss
+    layer_weights:
+      # before relu
+      'conv1_2': 0.3846
+      'conv2_2': 0.2083
+      'conv3_4': 0.2703
+      'conv4_4': 0.1786
+      'conv5_4': 6.6667
+    vgg_type: vgg19
+    use_input_norm: true
+    perceptual_weight: !!float 0.01
+    style_weight: 0.0
+    range_norm: false
+    criterion: l1
 
-  # DSIT specific losses
-  exclu_opt:
-    type: DSITExclusionLoss
-    loss_weight: 1.0
-
-  recons_opt:
-    type: DSITReconsLoss
-    loss_weight: !!float 2e-1
+  #  exclusion loss
+  exclusion_opt:
+    type: ExclusionLoss
+    level: 3
+    eps: !!float 0.000001
+    loss_weight: !!float 1.0
 
 # validation settings
 val:
   save_img: True
   save_img_top_n: 1
-  
+
   metrics:
-    psnr: # metric name
+    psnr:  # metric name
       type: calculate_psnr
     ssim:
       type: calculate_ssim

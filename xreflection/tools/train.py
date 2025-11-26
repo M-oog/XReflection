@@ -36,8 +36,10 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=None, help='Random seed, overrides config if provided')
     
     # Optional overrides for quick testing/debugging without editing config
-    parser.add_argument('--test_only', action='store_true', help='Only test the model, overrides config')
-    parser.add_argument('--resume', type=str, help='Resume from checkpoint, overrides config if provided')
+    parser.add_argument('--test_only', type=str, default=None, help='Only test the model, overrides config')
+    parser.add_argument('--resume', nargs='?', const='_FIND_LAST_', default=None, 
+                        help='Resume from checkpoint, overrides config if provided. If used without a path (e.g., --resume), it will try to find and load "last.ckpt".'
+                             'If used with a path (e.g., --resume path/to/ckpt), it will load the specified checkpoint.')
     
     # General override mechanism - allows overriding any config setting from command line
     parser.add_argument('--override', nargs='+', default=[], 
@@ -158,6 +160,7 @@ def create_datamodule(config):
             test_loaders = []
             for test_idx, test_dataset in enumerate(self.test_datasets):
                 test_config = self.config['datasets']['val_datasets'][test_idx]
+                test_config['phase'] = 'test'
                 test_loaders.append(build_dataloader(test_dataset, test_config))
             
             return test_loaders
@@ -177,11 +180,12 @@ def create_callbacks(config):
     
     checkpoint_callback = ModelCheckpoint(
         dirpath=os.path.join(config['path']['experiments_root'], config['name'], 'checkpoints'),
-        filename='{epoch}-{' + monitor + ':.4f}',
+        filename='{epoch}-{step}-{' + monitor + ':.4f}',
         monitor=monitor,
         mode=mode,
         save_top_k=save_top_k,
         save_last=True,
+        save_on_train_epoch_end=False,
         verbose=True
     )
     callbacks.append(checkpoint_callback)
@@ -190,46 +194,6 @@ def create_callbacks(config):
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
     callbacks.append(lr_monitor)
     
-    # LR Warmup Callback (if enabled)
-    warmup_epochs = config.get('train', {}).get('warmup_epochs', 0)
-    if warmup_epochs > 0:
-        warmup_callback = LRWarmupCallback(
-            warmup_epochs=warmup_epochs,
-            initial_lr_factor=0.1,  # Start with 10% of the target learning rate
-            verbose=True
-        )
-        callbacks.append(warmup_callback)
-        print(f"Learning Rate Warmup enabled for {warmup_epochs} epochs")
-    
-    # EMA Callback (if enabled)
-    ema_decay = config.get('train', {}).get('ema_decay', 0)
-    if ema_decay > 0:
-        ema_update_interval = config.get('train', {}).get('ema_update_interval', 1)
-        ema_callback = EMACallback(
-            decay=ema_decay,
-            update_interval=ema_update_interval
-        )
-        callbacks.append(ema_callback)
-        print(f"EMA enabled with decay factor: {ema_decay}, update interval: {ema_update_interval}")
-    
-    # Early stopping (optional)
-    if config.get('early_stopping', False):
-        early_stop_config = config['early_stopping']
-        # Use the same monitor and mode as checkpoint by default
-        early_stop_monitor = early_stop_config.get('monitor', monitor)
-        early_stop_mode = early_stop_config.get('mode', mode)
-        
-        early_stop = EarlyStopping(
-            monitor=early_stop_monitor,
-            patience=early_stop_config.get('patience', 10),
-            mode=early_stop_mode,
-            min_delta=early_stop_config.get('min_delta', 0.01),
-            verbose=True
-        )
-        callbacks.append(early_stop)
-        print(f"Early stopping enabled: monitoring {early_stop_monitor}, mode {early_stop_mode}, "
-              f"patience {early_stop_config.get('patience', 10)}")
-        
     return callbacks
 
 
@@ -256,14 +220,17 @@ def main():
     # Resume from checkpoint if specified
     resume_path = config['path'].get('resume_state', None)
     if args.resume is not None:
-        resume_path = args.resume
+        if args.resume == '_FIND_LAST_':
+            resume_path = os.path.join(exp_dir, 'checkpoints', 'last.ckpt')
+        else:
+            resume_path = args.resume
     
     # Create directories only on main process (rank 0)
     # Check if this is the main process using Lightning's utility
     is_main_process = L.fabric.utilities.rank_zero.rank_zero_only.rank == 0
     
     if is_main_process:
-        if os.path.exists(exp_dir) and resume_path is None:
+        if os.path.exists(exp_dir) and resume_path is None and args.test_only is None:
             os.rename(f"{exp_dir}", f"{exp_dir}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
         # Create experiment directory
         os.makedirs(exp_dir, exist_ok=True)
@@ -349,8 +316,8 @@ def main():
     rank_zero_info(f"Configuration: {config}")
     
     # Test only or train + validate
-    if config.get('test_only', False):
-        trainer.test(model, datamodule=datamodule, ckpt_path=resume_path)
+    if args.test_only is not None:
+        trainer.test(model, datamodule=datamodule, ckpt_path=args.test_only)
     else:
         trainer.fit(model, datamodule=datamodule, ckpt_path=resume_path)
         if len(callbacks) > 0 and hasattr(callbacks[0], 'best_model_path'):

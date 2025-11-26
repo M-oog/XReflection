@@ -9,7 +9,56 @@ from xreflection.utils.registry import MODEL_REGISTRY
 from xreflection.metrics import calculate_metric
 from xreflection.utils import imwrite, tensor2img
 from lightning.pytorch.utilities import rank_zero_only, rank_zero_info, rank_zero_warn
-from torchmetrics import MetricCollection
+from torchmetrics import Metric, MetricCollection
+
+
+class XMetricWrapper(Metric):
+    """A X metric wrapper for any metric calculated by `calculate_metric`.
+    
+    This wrapper handles the state management (total, count) and distributed
+    synchronization, while using the provided X function for the actual
+    metric calculation on each step.
+    """
+    # This is a good practice to indicate if a higher value is better.
+    higher_is_better = True
+    # Ensures that state is synced across all processes before computing the metric
+    full_state_update = True
+
+    def __init__(self, metric_opt):
+        super().__init__()
+        self.opt_ = metric_opt
+        # Initialize states for summation and count, which will be synced across GPUs
+        self.add_state("total", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("count", default=torch.tensor(0.0), dist_reduce_fx="sum")
+
+    def update(self, preds: torch.Tensor, target: torch.Tensor):
+        """
+        Update state with predictions and targets for a single batch.
+        
+        Args:
+            preds (torch.Tensor): The estimated clean image tensor.
+            target (torch.Tensor): The ground truth clean image tensor.
+        """
+        # Convert tensors to numpy images, as expected by the original calculate_metric
+        pred_img = tensor2img(preds)
+        target_img = tensor2img(target)
+
+        metric_data = {'img': pred_img, 'img2': target_img}
+        
+        # Here we call the user's custom metric calculation function
+        metric_value = calculate_metric(metric_data, self.opt_)
+        
+        self.total += metric_value
+        self.count += 1
+
+    def compute(self):
+        """
+        Computes the final metric value over all collected batches.
+        """
+        # Handle cases where a metric was not updated to avoid division by zero
+        if self.count == 0:
+            return torch.tensor(0.0, device=self.total.device)
+        return self.total / self.count
 
 
 @MODEL_REGISTRY.register()
@@ -35,7 +84,6 @@ class BaseModel(L.LightningModule):
         # Define network
         self.net_g = build_network(opt['network_g'])
 
-        self.current_val_metrics = {}
         self.val_dataset_names = {}
         self.top_psnr_epochs = []
         self.top_ssim_epochs = []
@@ -43,6 +91,22 @@ class BaseModel(L.LightningModule):
         # Flag to indicate if using EMA - will be set by EMACallback
         self.use_ema = False
 
+        # CORRECT: Initialize metrics in __init__ based on the provided config
+        self.val_metrics = torch.nn.ModuleDict()
+        self.total_val_metrics = None  # Will be a single MetricCollection
+
+        metrics_conf = self.opt['val'].get('metrics')
+        if metrics_conf and 'val_datasets' in self.opt['datasets']:
+            # Setup per-dataset metrics by parsing the val_datasets list from config
+            for d_opt in self.opt['datasets']['val_datasets']:
+                d_name = d_opt['name']
+                metrics_to_track = {m_name: XMetricWrapper(metric_opt=m_opt) for m_name, m_opt in metrics_conf.items()}
+                self.val_metrics[d_name] = MetricCollection(metrics_to_track)
+            
+            # Setup a single metric collection for the true grand average calculation
+            total_metrics_to_track = {m_name: XMetricWrapper(metric_opt=m_opt) for m_name, m_opt in metrics_conf.items()}
+            self.total_val_metrics = MetricCollection(total_metrics_to_track)
+        
     def setup(self, stage: Optional[str] = None):
         """Setup module based on stage.
         
@@ -57,8 +121,8 @@ class BaseModel(L.LightningModule):
         if load_path is not None:
             self.load_weights(load_path)
 
-        if stage == 'fit' or stage is None:
-            self.setup_losses()
+        # if stage == 'fit' or stage is None:
+        self.setup_losses()
 
     def load_weights(self, load_path):
         """Load pretrained weights.
@@ -208,30 +272,20 @@ class BaseModel(L.LightningModule):
             rank_zero_warn(f"'inp_path' key missing in batch, using fallback name: {img_name}")
 
         # 处理图像用于指标计算和可视化
-        clean_img = tensor2img([output_clean])
-        reflection_img = tensor2img([output_reflection])
-        target_t_img = tensor2img([batch['target_t']])
-
-        metric_data = {'img': clean_img, 'img2': target_t_img}
-
-
+        clean_img = tensor2img(output_clean)
+        reflection_img = tensor2img(output_reflection)
+        
         # 保存验证图像
         if self.opt['val'].get('save_img', False):
             self._save_images(clean_img, reflection_img, img_name, dataset_name)
 
         # 计算指标
-        if 'img2' in metric_data and self.opt['val'].get('metrics') is not None:
-            for name, opt_ in self.opt['val']['metrics'].items():
-                try:
-                    metric_value = calculate_metric(metric_data, opt_)
-                    # 存储以供后续聚合
-                    if dataset_name not in self.current_val_metrics:
-                        self.current_val_metrics[dataset_name] = {}
-                    if name not in self.current_val_metrics[dataset_name]:
-                        self.current_val_metrics[dataset_name][name] = []
-                    self.current_val_metrics[dataset_name][name].append(metric_value)
-                except Exception as e:
-                    rank_zero_warn(f"Error calculating metric '{name}': {str(e)}") 
+        if 'target_t' in batch:
+            # Update per-dataset metrics for per-dataset logging
+            self.val_metrics[dataset_name].update(output_clean, batch['target_t'])
+            # Update the single, overarching metric for the true grand average
+            if self.total_val_metrics is not None:
+                self.total_val_metrics.update(output_clean, batch['target_t'])
 
         return {
             'output_clean': output_clean,
@@ -241,73 +295,76 @@ class BaseModel(L.LightningModule):
         }
 
     def on_validation_epoch_start(self):
-        """Setup metrics collection at the start of validation epoch."""
-        self.current_val_metrics = {}
-        
-        # 获取验证数据集名称，用于后续记录和显示
+        # This hook's sole responsibility is to
+        # map dataloader indices to their names for use in validation_step.
         if hasattr(self, 'trainer') and hasattr(self.trainer, 'val_dataloaders'):
-            if isinstance(self.trainer.val_dataloaders, list):
-                for idx, loader in enumerate(self.trainer.val_dataloaders):
-                    if hasattr(loader.dataset, 'opt') and 'name' in loader.dataset.opt:
-                        dataset_name = loader.dataset.opt['name']
-                    else:
-                        dataset_name = f"val_{idx}"
-                    self.val_dataset_names[idx] = dataset_name
-            else:
-                # 单个验证集情况
-                loader = self.trainer.val_dataloaders
+            dataloaders = self.trainer.val_dataloaders
+            if not isinstance(dataloaders, list):
+                dataloaders = [dataloaders]
+            for idx, loader in enumerate(dataloaders):
+                # This assumes the dataset name in the dataloader opt matches the config.
                 if hasattr(loader.dataset, 'opt') and 'name' in loader.dataset.opt:
-                    dataset_name = loader.dataset.opt['name']
-                else:
-                    dataset_name = "val"
-                self.val_dataset_names[0] = dataset_name
+                    self.val_dataset_names[idx] = loader.dataset.opt['name']
+                else: 
+                    # Fallback to the order in the config file if name not in loader opt
+                    self.val_dataset_names[idx] = self.opt['datasets']['val_datasets'][idx]['name']
+
 
     def on_validation_epoch_end(self):
         """Operations at the end of validation epoch."""
-        # Calculate and log average metrics across all validation samples
-        if self.current_val_metrics:
-            total_average_metrics = {}
-            for dataset_name, metrics in self.current_val_metrics.items():
-                log_str = f'\n Validation [{dataset_name}] Epoch {self.current_epoch}\n'
+        # --- CORRECT: All processes must participate in .compute() ---
+        
+        # 1. Compute per-dataset metrics on all ranks
+        all_final_metrics = {}
+        for dataset_name, metrics_collection in self.val_metrics.items():
+            all_final_metrics[dataset_name] = metrics_collection.compute()
 
-                for metric_name, values in metrics.items():
-                    
-                    avg_value = sum(values) / len(values)
-                    log_str += f'\t # {metric_name}: {avg_value:.4f}'
+        # 2. Compute the true, correctly weighted grand average on all ranks
+        final_avg_metrics = self.total_val_metrics.compute() if self.total_val_metrics is not None else {}
 
-                    self.log(f'metrics/{dataset_name}/{metric_name}', avg_value, on_epoch=True, on_step=False, sync_dist=True)
-                    if metric_name not in total_average_metrics.keys():
-                        total_average_metrics[metric_name] = {
-                            'val': sum(values),
-                            'counts' : len(values)
-                        }
-                    else:
-                        total_average_metrics[metric_name]['val'] += sum(values)
-                        total_average_metrics[metric_name]['counts'] += len(values)
-                # Log to console
-                rank_zero_info(log_str)
-            total_average_metrics = {
-                k: v['val'] / v['counts'] for k, v in total_average_metrics.items()
-            }
-            
-            log_str = f'\n Validation Epoch {self.current_epoch} Average Metrics:\n'
-            for metric_name, metric_value in total_average_metrics.items():
-                self.log(f'metrics/average/{metric_name}', metric_value, on_epoch=True, on_step=False, sync_dist=True)
-                log_str += f'\t # {metric_name}: {metric_value:.4f}'
-            
+        # --- CORRECT: Only rank 0 performs printing and other logic ---
+        # if self.trainer.is_global_zero:
+        # Log per-dataset results
+        for dataset_name, final_metrics in all_final_metrics.items():
+            log_str = f'\n Validation [{dataset_name}] Epoch {self.current_epoch}\n'
+            for name, value in final_metrics.items():
+                log_str += f'\t # {name}: {value.item():.4f}'
+                # Log the final, computed value. sync_dist=True is safe and handles potential warnings.
+                self.log(f'metrics/{dataset_name}/{name}', value, sync_dist=True)
             rank_zero_info(log_str)
-            
-            self.top_psnr_epochs.append((total_average_metrics['psnr'], self.current_epoch))
+
+        # Log the grand average
+        if final_avg_metrics:
+            log_str = f'\n Validation Epoch {self.current_epoch} Average Metrics:\n'
+            for name, value in final_avg_metrics.items():
+                self.log(f'metrics/average/{name}', value, sync_dist=True)
+                log_str += f'\t # {name}: {value.item():.4f}'
+            rank_zero_info(log_str)
+
+        # Convert to plain dict for downstream logic. Important to do this on rank 0 only.
+        plain_avg_metrics = {k: v.item() for k, v in final_avg_metrics.items()}
+
+        # 3. Handle top epochs logic based on the grand average
+        if 'psnr' in plain_avg_metrics:
+            self.top_psnr_epochs.append((plain_avg_metrics['psnr'], self.current_epoch, self.global_step))
             self.top_psnr_epochs.sort(key=lambda x: (x[0], x[1]), reverse=True)
             self.top_psnr_epochs = self.top_psnr_epochs[:self.opt['val'].get('save_img_top_n', 5)]
-            rank_zero_info(f'\t # The Best Average PSNR: {self.top_psnr_epochs[0][0]:.4f} at Epoch {self.top_psnr_epochs[0][1]}')
-            
-            self.top_ssim_epochs.append((total_average_metrics['ssim'], self.current_epoch))
+            rank_zero_info(f'\t # The Best Average PSNR: {self.top_psnr_epochs[0][0]:.4f} at Epoch {self.top_psnr_epochs[0][1]} Step {self.top_psnr_epochs[0][2]}')
+        
+        if 'ssim' in plain_avg_metrics:
+            self.top_ssim_epochs.append((plain_avg_metrics['ssim'], self.current_epoch, self.global_step))
             self.top_ssim_epochs.sort(key=lambda x: (x[0], x[1]), reverse=True)
             self.top_ssim_epochs = self.top_ssim_epochs[:1]
-            rank_zero_info(f'\t # The Best Average SSIM: {self.top_ssim_epochs[0][0]:.4f} at Epoch {self.top_ssim_epochs[0][1]}\n')
-            
-            self._delete_images_not_in_top_psnr()
+            rank_zero_info(f'\t # The Best Average SSIM: {self.top_ssim_epochs[0][0]:.4f} at Epoch {self.top_ssim_epochs[0][1]} Step {self.top_ssim_epochs[0][2]}\n')
+
+        # 4. Clean up old images
+        self._delete_images_not_in_top_psnr()
+
+        # --- CORRECT: All processes must reset the state ---
+        for metrics_collection in self.val_metrics.values():
+            metrics_collection.reset()
+        if self.total_val_metrics is not None:
+            self.total_val_metrics.reset()
 
     def test_step(self, batch, batch_idx, dataloader_idx=0):
         """Test step.
@@ -323,28 +380,23 @@ class BaseModel(L.LightningModule):
     
     def on_test_epoch_start(self):
         """Operations at the start of test epoch."""
-        """Setup metrics collection at the start of test epoch."""
-        self.current_val_metrics = {}
+        # This hook's sole responsibility is to
+        # map dataloader indices to their names for use in validation_step.
         if hasattr(self, 'trainer') and hasattr(self.trainer, 'test_dataloaders'):
-            if isinstance(self.trainer.test_dataloaders, list):
-                for idx, loader in enumerate(self.trainer.test_dataloaders):
-                    if hasattr(loader.dataset, 'opt') and 'name' in loader.dataset.opt:
-                        dataset_name = loader.dataset.opt['name']
-                    else:
-                        dataset_name = f"test_{idx}"
-                    self.val_dataset_names[idx] = dataset_name
-            else:
-                # 单个验证集情况
-                loader = self.trainer.test_dataloaders
+            dataloaders = self.trainer.test_dataloaders
+            if not isinstance(dataloaders, list):
+                dataloaders = [dataloaders]
+            for idx, loader in enumerate(dataloaders):
+                # This assumes the dataset name in the dataloader opt matches the config.
                 if hasattr(loader.dataset, 'opt') and 'name' in loader.dataset.opt:
-                    dataset_name = loader.dataset.opt['name']
-                else:
-                    dataset_name = "test"
-                self.val_dataset_names[0] = dataset_name
+                    self.val_dataset_names[idx] = loader.dataset.opt['name']
+                else: 
+                    # Fallback to the order in the config file if name not in loader opt
+                    self.val_dataset_names[idx] = self.opt['datasets']['val_datasets'][idx]['name']
     
     def on_test_epoch_end(self):
         """Operations at the end of test epoch."""
-        return self.on_validation_epoch_end()
+        self.on_validation_epoch_end()
 
     def configure_optimizer_params(self):
         """Configure optimizer parameters.
@@ -376,7 +428,7 @@ class BaseModel(L.LightningModule):
             raise NotImplementedError(f'Scheduler {scheduler_type} is not implemented yet.')
 
         # Get the monitor metric from checkpoint config if available
-        monitor_metric = self.opt.get('checkpoint', {}).get('monitor', 'val/psnr')
+        monitor_metric = self.opt.get('checkpoint', {}).get('monitor', 'metrics/average/psnr')
 
         return {
             "optimizer": optimizer,
@@ -422,11 +474,11 @@ class BaseModel(L.LightningModule):
             save_dir = osp.join(self.opt['path']['visualization'], dataset_name, img_name)
             os.makedirs(save_dir, exist_ok=True)
             if self.opt['val'].get('suffix'):
-                save_clean_img_path = osp.join(save_dir, f'{img_name}_clean_{self.opt["val"]["suffix"]}_epoch_{self.current_epoch}.png')
-                save_reflection_img_path = osp.join(save_dir, f'{img_name}_reflection_{self.opt["val"]["suffix"]}_epoch_{self.current_epoch}.png')
+                save_clean_img_path = osp.join(save_dir, f'{img_name}_clean_{self.opt["val"]["suffix"]}_epoch_{self.current_epoch}_step_{self.global_step}.png')
+                save_reflection_img_path = osp.join(save_dir, f'{img_name}_reflection_{self.opt["val"]["suffix"]}_epoch_{self.current_epoch}_step_{self.global_step}.png')
             else:
-                save_clean_img_path = osp.join(save_dir, f'{img_name}_clean_{self.opt["name"]}_epoch_{self.current_epoch}.png')
-                save_reflection_img_path = osp.join(save_dir, f'{img_name}_reflection_{self.opt["name"]}_epoch_{self.current_epoch}.png')
+                save_clean_img_path = osp.join(save_dir, f'{img_name}_clean_{self.opt["name"]}_epoch_{self.current_epoch}_step_{self.global_step}.png')
+                save_reflection_img_path = osp.join(save_dir, f'{img_name}_reflection_{self.opt["name"]}_epoch_{self.current_epoch}_step_{self.global_step}.png')
             # 保存图像
             imwrite(clean_img, save_clean_img_path)
             imwrite(reflection_img, save_reflection_img_path)
@@ -434,7 +486,12 @@ class BaseModel(L.LightningModule):
             rank_zero_warn(f"Error saving validation images: {str(e)}")
     
     def _delete_images_not_in_top_psnr(self):
-        top_epochs_to_keep = [e for _, e in self.top_psnr_epochs]
+        # Use a set for efficient lookup of image identifiers to keep.
+        # This includes the top N PSNR epochs and the current one.
+        ids_to_keep = set((e, s) for _, e, s in self.top_psnr_epochs)
+        current_id = (self.current_epoch, self.global_step)
+        ids_to_keep.add(current_id)
+
         visualization_root_path = self.opt['path']['visualization']
 
         if not osp.isdir(visualization_root_path):
@@ -443,25 +500,26 @@ class BaseModel(L.LightningModule):
 
         for root, _, files in os.walk(visualization_root_path):
             for file_name in files:
-                # Optional: filter for common image file extensions
+                # Filter for common image file extensions
                 if not file_name.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
                     continue
 
                 file_path = osp.join(root, file_name)
-                if not osp.isfile(file_path): # Ensure it's a file before attempting to process/delete
+                if not osp.isfile(file_path):
                     continue
                 
-                epoch_match = re.search(r'epoch_(\d+)', file_name)
-                if epoch_match:
-                    img_epoch = int(epoch_match.group(1))
+                match = re.search(r'epoch_(\d+)_step_(\d+)', file_name)
+                if match:
+                    img_id = (int(match.group(1)), int(match.group(2)))
 
-                    # Protect images from the current epoch and those explicitly in top_epochs_to_keep
-                    if img_epoch == self.current_epoch or img_epoch in top_epochs_to_keep:
+                    # If the image identifier is in our set, keep it.
+                    if img_id in ids_to_keep:
                         continue
                     
-                    # If the epoch is not the current one and not in top_epochs_to_keep, delete it
+                    # Otherwise, delete the file.
                     try:
                         os.remove(file_path)
-                        # rank_zero_info(f"Deleted old image not in top PSNR epochs: {file_path}") # Optional: for verbose logging
+                        # rank_zero_info(f"Deleted old image not in top PSNR epochs: {file_path}")
                     except Exception as e:
-                        rank_zero_warn(f"Error deleting image {file_path}: {str(e)}")
+                        # rank_zero_warn(f"Error deleting image {file_path}: {str(e)}")
+                        pass

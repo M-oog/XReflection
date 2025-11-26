@@ -13,9 +13,18 @@ XReflection is a neat toolbox tailored for single-image reflection removal(SIRR)
 
 
 ---
-## 📰 News and Updates
+## 🏆 Award
 
-- **[Upcoming]** More models are on the way!
+Equipped with XReflection, our team won the 1st place in the NTIRE 2025 Challenge on Single Image Reflection Removal in the Wild.
+
+<div align="center"><img src="docs/_static/NTIRE.png" alt="NTIRE 2025 Award" width="80%"/></div>
+
+<br>
+
+---
+## 📰 News and Updates
+- **[2025-10-26]** XReflection is now production-ready and have been applied to multiple research projects inside our team. DSIT is available in the model zoo. More models are on the way!
+- **[2025-07-16]** DSRNet is available in the model zoo. More models are on the way!
 - **[2025-05-26]** Release a training/testing pipeline. 
 
 ---
@@ -30,22 +39,15 @@ XReflection is a neat toolbox tailored for single-image reflection removal(SIRR)
 
 Please visit the [documentation](https://xreflection.readthedocs.io/en/latest/) for more features and usage.
 
-
 ---
 
 ## 🚀 Installation
 
-### Requirements
-Make sure you have the following system dependencies installed:
-- Python >= 3.10
-- PyTorch >= 2.5
-- PyTorchLightning >= 2.5
-- CUDA >= 12.1 (for GPU support)
 
 ### Installation Commands
 ```bash
-# Clone the repository
-git clone https://github.com/your-username/XReflection.git
+# Build from source
+git clone https://github.com/hainuo-wang/XReflection.git
 cd XReflection
 
 # Install dependencies
@@ -57,10 +59,9 @@ python setup.py develop
 
 ## 📦 Getting Started
 
-### Inference with Pretrained Models
-Run reflection removal on an image:
+### Testing a Pretrained Model
 ```python
-TODO
+python tools/train.py --config configs/train_config.yaml --test_only pretrained.ckpt
 ```
 
 ### Training a Model
@@ -68,12 +69,22 @@ TODO
 python tools/train.py --config configs/train_config.yaml
 ```
 
+### Resume Training
+#### from the last checkpoint
+```python
+python tools/train.py --config configs/train_config.yaml --resume
+```
+#### from the a specific checkpoint
+```python
+python tools/train.py --config configs/train_config.yaml --resume your_checkpoint_path.ckpt
+```
+
 ### Data Preparation
 #### Training dataset
 * 7,643 images from the
   [Pascal VOC dataset](http://host.robots.ox.ac.uk/pascal/VOC/), center-cropped as 224 x 224 slices to synthesize training pairs;
 * 90 real-world training pairs provided by [Zhang *et al.*](https://github.com/ceciliavision/perceptual-reflection-removal);
-* 200 real-world training pairs provided by [IBCLN](https://github.com/JHL-HUST/IBCLN) (In our training setting 2, &dagger; labeled in our paper).
+* 200 real-world training pairs provided by [IBCLN](https://github.com/JHL-HUST/IBCLN).
 
 #### Testing dataset
 * 45 real-world testing images from [CEILNet dataset](https://github.com/fqnchina/CEILNet);
@@ -88,9 +99,13 @@ Download all in one from https://checkpoints.mingjia.li/sirs.zip
 ## 🌟 Features in Detail
 
 ### Pretrained Model Zoo
-Access pretrained models for various SIRR algorithms:
-TODO
+The performance of previous methods are improved with our new training pipeline.
+Access pretrained models for various SIRR algorithms. More are on the way.
 
+|Model| Link| PSNR(dB)|
+|---|---|---|
+|DSRNet|https://checkpoints.mingjia.li/dsr-25.8915.ckpt|25.8915|
+|DSIT|https://checkpoints.mingjia.li/dsit-26.6959.ckpt| 26.6959|
 
 <!-- ---
 
