@@ -4,6 +4,23 @@ import torch.nn as nn
 from collections import OrderedDict
 from xreflection.archs.dsrnet.lrm import LRM
 
+from xreflection.archs.quantize_arch import QuantConv2d, build_conv
+
+
+class QuantArgs:
+    def __init__(self, **kwargs):
+        # 设置默认值
+        self.quantize = False
+        self.quantize_a = 8.0
+        self.quantize_w = 8.0
+        self.quantizer = 'percentile'
+        self.quantizer_w = 'omse'
+        self.percentile_alpha = 0.999
+        self.ema_beta = 0.99
+        self.wbc = True
+        # 用传入的字典覆盖默认值
+        self.__dict__.update(kwargs)
+
 
 class LayerNormFunction(torch.autograd.Function):
 
@@ -46,11 +63,12 @@ class LayerNorm2d(nn.Module):
 
 
 class CABlock(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, channels, args=None):
         super(CABlock, self).__init__()
         self.ca = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, channels, 1)
+            # nn.Conv2d(channels, channels, 1)
+            build_conv(channels, channels, 1, bias=True, args=args)
         )
 
     def forward(self, x):
@@ -89,17 +107,19 @@ class DualStreamBlock(nn.Module):
 
 
 class MuGIBlock(nn.Module):
-    def __init__(self, c, shared_b=False):
+    def __init__(self, c, shared_b=False, args=None):
         super().__init__()
         self.block1 = DualStreamSeq(
             DualStreamBlock(
                 LayerNorm2d(c),
-                nn.Conv2d(c, c * 2, 1),
-                nn.Conv2d(c * 2, c * 2, 3, padding=1, groups=c * 2)
+                # nn.Conv2d(c, c * 2, 1),
+                # nn.Conv2d(c * 2, c * 2, 3, padding=1, groups=c * 2)
+                build_conv(c, c * 2, 1, args=args),
+                build_conv(c * 2, c * 2, 3, padding=1, groups=c * 2, args=args)
             ),
             DualStreamGate(),
-            DualStreamBlock(CABlock(c)),
-            DualStreamBlock(nn.Conv2d(c, c, 1))
+            DualStreamBlock(CABlock(c, args=args)),
+            DualStreamBlock(build_conv(c, c, 1, args=args))
         )
 
         self.a_l = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
@@ -136,65 +156,69 @@ class MuGIBlock(nn.Module):
 
 
 class FeaturePyramidVGG(nn.Module):
-    def __init__(self, out_channels=64, shared_b=False):
+    def __init__(self, out_channels=64, shared_b=False, args=None):
         super().__init__()
         self.device = 'cuda'
         self.block5 = DualStreamSeq(
-            MuGIBlock(512, shared_b),
+            MuGIBlock(512, shared_b, args=args),
             DualStreamBlock(nn.UpsamplingBilinear2d(scale_factor=2.0)),
         )
 
         self.block4 = DualStreamSeq(
-            MuGIBlock(512, shared_b)
+            MuGIBlock(512, shared_b, args=args)
         )
 
         self.ch_map4 = DualStreamSeq(
             DualStreamBlock(
-                nn.Conv2d(in_channels=1024, out_channels=1024, kernel_size=1),
+                # nn.Conv2d(in_channels=1024, out_channels=1024, kernel_size=1),
+                build_conv(1024, 1024, 1, args=args),
                 nn.PixelShuffle(2)),
-            MuGIBlock(256, shared_b)
+            MuGIBlock(256, shared_b, args=args)
         )
 
         self.block3 = DualStreamSeq(
-            MuGIBlock(256, shared_b)
+            MuGIBlock(256, shared_b, args=args)
         )
 
         self.ch_map3 = DualStreamSeq(
             DualStreamBlock(
-                nn.Conv2d(in_channels=512, out_channels=512, kernel_size=1),
+                # nn.Conv2d(in_channels=512, out_channels=512, kernel_size=1),
+                build_conv(512, 512, 1, args=args),
                 nn.PixelShuffle(2)),
-            MuGIBlock(128, shared_b)
+            MuGIBlock(128, shared_b, args=args)
         )
 
         self.block2 = DualStreamSeq(
-            MuGIBlock(128, shared_b)
+            MuGIBlock(128, shared_b, args=args)
         )
 
         self.ch_map2 = DualStreamSeq(
             DualStreamBlock(
-                nn.Conv2d(in_channels=256, out_channels=256, kernel_size=1),
+                # nn.Conv2d(in_channels=256, out_channels=256, kernel_size=1),
+                build_conv(256, 256, 1, args=args),
                 nn.PixelShuffle(2)),
-            MuGIBlock(64, shared_b)
+            MuGIBlock(64, shared_b, args=args)
         )
 
         self.block1 = DualStreamSeq(
-            MuGIBlock(64, shared_b),
+            MuGIBlock(64, shared_b, args=args),
         )
 
         self.ch_map1 = DualStreamSeq(
-            DualStreamBlock(nn.Conv2d(in_channels=128, out_channels=128, kernel_size=1)),
-            MuGIBlock(128, shared_b),
-            DualStreamBlock(nn.Conv2d(in_channels=128, out_channels=32, kernel_size=1)),
-            MuGIBlock(32, shared_b),
+            DualStreamBlock(build_conv(128, 128, 1, args=args)),
+            MuGIBlock(128, shared_b, args=args),
+            DualStreamBlock(build_conv(128, 32, 1, args=args)),
+            MuGIBlock(32, shared_b, args=args),
         )
 
         self.block_intro = DualStreamSeq(
-            DualStreamBlock(nn.Conv2d(in_channels=3, out_channels=32, kernel_size=3, padding=1)),
-            MuGIBlock(32, shared_b)
+            DualStreamBlock(build_conv(3, 32, 3, padding=1, args=args)),
+            MuGIBlock(32, shared_b, args=args)
         )
 
         self.ch_map0 = DualStreamBlock(
-            nn.Conv2d(in_channels=64, out_channels=out_channels, kernel_size=1)
+            # nn.Conv2d(in_channels=64, out_channels=out_channels, kernel_size=1)
+            build_conv(64, out_channels, 1, args=args)
         )
 
     def forward(self, inp, vgg_feats):
@@ -223,40 +247,60 @@ class FeaturePyramidVGG(nn.Module):
 @ARCH_REGISTRY.register()
 class DSRNet(nn.Module):
     def __init__(self, in_channels=3, out_channels=3, width=48, middle_blk_num=1,
-                 enc_blk_nums=[], dec_blk_nums=[], lrm_blk_nums=[], shared_b=False):
+                 enc_blk_nums=[], dec_blk_nums=[], lrm_blk_nums=[], shared_b=False,
+                 quant_config=None):
         super().__init__()
 
-        self.intro = FeaturePyramidVGG(width, shared_b)
-        self.ending = DualStreamBlock(nn.Conv2d(width, out_channels, 3, padding=1))
+        # ================== 统一转换逻辑 ==================
+        if quant_config is None:
+            # 情况1：没传参 -> 默认关闭量化
+            self.quant_args = QuantArgs(quantize=False)
+
+        elif isinstance(quant_config, dict):
+            # 情况2：传入字典 (来自 YAML) -> 转为对象
+            self.quant_args = QuantArgs(**quant_config)
+
+        elif hasattr(quant_config, 'quantize'):
+            # 情况3：传入对象 (来自 calibrate.py) -> 直接使用
+            self.quant_args = quant_config
+
+        else:
+            raise ValueError(f"Unsupported type for quant_config: {type(quant_config)}")
+        # =================================================
+
+        self.intro = FeaturePyramidVGG(width, shared_b, args=self.quant_args)
+        self.ending = DualStreamBlock(build_conv(width, out_channels, 3, padding=1, args=self.quant_args))
         self.encoders = nn.ModuleList()
         self.decoders = nn.ModuleList()
         self.middle_blks = nn.ModuleList()
         self.ups = nn.ModuleList()
         self.downs = nn.ModuleList()
-        self.lrm = LRM(width, num_blocks=lrm_blk_nums)
+        self.lrm = LRM(width, num_blocks=lrm_blk_nums, args=self.quant_args)
 
         c = width
         for num in enc_blk_nums:
             self.encoders.append(
                 DualStreamSeq(
-                    *[MuGIBlock(c, shared_b) for _ in range(num)]
+                    *[MuGIBlock(c, shared_b, args=self.quant_args) for _ in range(num)]
                 )
             )
             self.downs.append(
                 DualStreamBlock(
-                    nn.Conv2d(c, c * 2, 2, 2)
+                    # nn.Conv2d(c, c * 2, 2, 2)
+                    build_conv(c, c * 2, 2, stride=2, args=self.quant_args)
                 )
             )
             c *= 2
 
         self.middle_blks = DualStreamSeq(
-            *[MuGIBlock(c, shared_b) for _ in range(middle_blk_num)]
+            *[MuGIBlock(c, shared_b, args=self.quant_args) for _ in range(middle_blk_num)]
         )
 
         for num in dec_blk_nums:
             self.ups.append(
                 DualStreamBlock(
-                    nn.Conv2d(c, c * 2, 1, bias=False),
+                    # nn.Conv2d(c, c * 2, 1, bias=False),
+                    build_conv(c, c * 2, 1, bias=False, args=self.quant_args),
                     nn.PixelShuffle(2)
                 )
             )
@@ -264,9 +308,48 @@ class DSRNet(nn.Module):
 
             self.decoders.append(
                 DualStreamSeq(
-                    *[MuGIBlock(c, shared_b) for _ in range(num)]
+                    *[MuGIBlock(c, shared_b, args=self.quant_args) for _ in range(num)]
                 )
             )
+
+        # ================= 冻结权重逻辑 (参考 AdaBM) =================
+        # 如果开启了量化，且不是在做校准 (通常校准时也不需要梯度，这里主要针对训练阶段)
+        if self.quant_args.quantize:
+            self._freeze_for_partial_qat()
+
+    def _freeze_for_partial_qat(self):
+        """
+        参考 trainer-AdaBM.py 的逻辑：
+        只允许量化参数 (lower_a, upper_a, upper_w) 更新，
+        冻结所有卷积权重 (weight) 和偏置 (bias)。
+        """
+        print("=== [Config] Partial QAT Strategy Enabled ===")
+        print("INFO: Freezing CNN weights. Only training quantization parameters (Step Sizes).")
+
+        trainable_params = 0
+        frozen_params = 0
+
+        for name, param in self.named_parameters():
+            # 判断是否为量化参数
+            # 在 quantize_arch.py 中，我们定义了 lower_a, upper_a, upper_w
+            is_quant_param = 'lower_a' in name or 'upper_a' in name or 'upper_w' in name
+
+            # 此外，DSRNet 还有一些特定的标量参数 (a_l, a_r, b_l...) 用于双流融合
+            # 建议也放开这些参数的训练，因为它们只占极小的显存，却对融合至关重要
+            is_fusion_param = name.endswith('.a_l') or name.endswith('.a_r') or \
+                              name.endswith('.b_l') or name.endswith('.b_r') or \
+                              name.endswith('.a') or name.endswith('.b')
+
+            if is_quant_param or is_fusion_param:
+                param.requires_grad = True
+                trainable_params += param.numel()
+            else:
+                # 冻结卷积权重、BN层参数等
+                param.requires_grad = False
+                frozen_params += param.numel()
+
+        print(f"INFO: Frozen Params: {frozen_params / 1e6:.2f}M, Trainable Params: {trainable_params / 1e6:.2f}M")
+        print("=============================================")
 
     def forward(self, inp, feats_inp):
 
@@ -290,4 +373,3 @@ class DSRNet(nn.Module):
         x, y = self.ending(x, y)
 
         return x, y, rr
-

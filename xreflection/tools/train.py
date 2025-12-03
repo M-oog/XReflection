@@ -30,21 +30,21 @@ def parse_args():
     Users can override any config setting using --override.
     """
     parser = argparse.ArgumentParser(description='Train or test a reflection removal model using Lightning')
-    
+
     # Essential arguments
     parser.add_argument('--config', type=str, required=True, help='Config file path')
     parser.add_argument('--seed', type=int, default=None, help='Random seed, overrides config if provided')
-    
+
     # Optional overrides for quick testing/debugging without editing config
     parser.add_argument('--test_only', type=str, default=None, help='Only test the model, overrides config')
-    parser.add_argument('--resume', nargs='?', const='_FIND_LAST_', default=None, 
+    parser.add_argument('--resume', nargs='?', const='_FIND_LAST_', default=None,
                         help='Resume from checkpoint, overrides config if provided. If used without a path (e.g., --resume), it will try to find and load "last.ckpt".'
                              'If used with a path (e.g., --resume path/to/ckpt), it will load the specified checkpoint.')
-    
+
     # General override mechanism - allows overriding any config setting from command line
-    parser.add_argument('--override', nargs='+', default=[], 
-                      help='Override config options, format: key=value pairs (can specify multiple)')
-    
+    parser.add_argument('--override', nargs='+', default=[],
+                        help='Override config options, format: key=value pairs (can specify multiple)')
+
     args = parser.parse_args()
     return args
 
@@ -78,18 +78,18 @@ def process_config_overrides(config, args):
     # Handle specific overrides
     if args.seed is not None:
         config['manual_seed'] = args.seed
-    
+
     if args.test_only:
         config['test_only'] = True
-    
+
     # Process general overrides
     for override in args.override:
         if '=' not in override:
             print(f"Warning: Ignoring malformed override '{override}'. Format should be key=value")
             continue
-            
+
         key, value = override.split('=', 1)
-        
+
         # Try to convert value to appropriate type
         try:
             # Try to evaluate as literal (handles integers, floats, booleans, None)
@@ -98,7 +98,7 @@ def process_config_overrides(config, args):
         except (ValueError, SyntaxError):
             # If not a literal, keep as string
             pass
-            
+
         # Update nested configuration using dot notation (e.g., 'train.optim_g.lr')
         keys = key.split('.')
         current = config
@@ -107,53 +107,55 @@ def process_config_overrides(config, args):
                 current[k] = {}
             current = current[k]
         current[keys[-1]] = value
-        
+
         print(f"Override applied: {key} = {value}")
-        
+
     return config
 
 
 def create_datamodule(config):
     """Create Lightning DataModule from config"""
+
     class ReflectionDataModule(L.LightningDataModule):
         def __init__(self, config):
             super().__init__()
             self.config = config
             self.val_datasets = []
-            
+
         def setup(self, stage=None):
             # Build datasets
             if stage == 'fit' or stage is None:
                 train_config = self.config['datasets']['train']
                 train_config['phase'] = 'train'
                 self.train_dataset = build_dataset(train_config)
-                
+
                 # 创建所有验证数据集
                 self.val_datasets = []
                 for val_idx, val_config in enumerate(self.config['datasets']['val_datasets']):
                     val_config['phase'] = 'val'
                     val_dataset = build_dataset(val_config)
                     self.val_datasets.append(val_dataset)
-            
+
             if stage == 'test' or stage is None:
                 self.test_datasets = []
                 # Use validation set configurations for testing as per user request
                 for val_config_original in self.config['datasets']['val_datasets']:
                     # Create a copy to avoid modifying the original val_config
                     test_config = val_config_original.copy()
-                    test_config['phase'] = 'test' # Set phase to test
+                    test_config['phase'] = 'test'  # Set phase to test
                     test_dataset = build_dataset(test_config)
                     self.test_datasets.append(test_dataset)
-            
+
         def train_dataloader(self):
-            return build_dataloader(self.train_dataset, self.config['datasets']['train'], seed=self.config['manual_seed'])
-            
+            return build_dataloader(self.train_dataset, self.config['datasets']['train'],
+                                    seed=self.config['manual_seed'])
+
         def val_dataloader(self):
             val_loaders = []
             for val_idx, val_dataset in enumerate(self.val_datasets):
                 val_config = self.config['datasets']['val_datasets'][val_idx]
                 val_loaders.append(build_dataloader(val_dataset, val_config))
-            
+
             return val_loaders
 
         def test_dataloader(self):
@@ -162,22 +164,22 @@ def create_datamodule(config):
                 test_config = self.config['datasets']['val_datasets'][test_idx]
                 test_config['phase'] = 'test'
                 test_loaders.append(build_dataloader(test_dataset, test_config))
-            
+
             return test_loaders
-        
+
     return ReflectionDataModule(config)
 
 
 def create_callbacks(config):
     """Create Lightning callbacks from config"""
     callbacks = []
-    
+
     # Model checkpoint callback
     checkpoint_config = config.get('checkpoint', {})
     monitor = checkpoint_config.get('monitor', 'val/psnr')
     mode = checkpoint_config.get('mode', 'max')  # 'max' for metrics like PSNR, 'min' for loss
     save_top_k = checkpoint_config.get('save_top_k', 3)
-    
+
     checkpoint_callback = ModelCheckpoint(
         dirpath=os.path.join(config['path']['experiments_root'], config['name'], 'checkpoints'),
         filename='{epoch}-{step}-{' + monitor + ':.4f}',
@@ -189,34 +191,34 @@ def create_callbacks(config):
         verbose=True
     )
     callbacks.append(checkpoint_callback)
-    
+
     # Learning rate monitor
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
     callbacks.append(lr_monitor)
-    
+
     return callbacks
 
 
 def main():
     # Parse command-line arguments
     args = parse_args()
-    
+
     # Load configuration
     config = load_config(args.config)
-    
+
     # Process overrides
     config = process_config_overrides(config, args)
-    
+
     # Set random seed
     setup_random_seed(config['manual_seed'])
-    
+
     # Print configuration
     # Will be printed later only on main process within the trainer
-    
+
     # Define paths
     exp_dir = os.path.join(config['path']['experiments_root'], config['name'])
     vis_dir = os.path.join(exp_dir, 'visualization')
-    
+
     # Resume from checkpoint if specified
     resume_path = config['path'].get('resume_state', None)
     if args.resume is not None:
@@ -224,11 +226,11 @@ def main():
             resume_path = os.path.join(exp_dir, 'checkpoints', 'last.ckpt')
         else:
             resume_path = args.resume
-    
+
     # Create directories only on main process (rank 0)
     # Check if this is the main process using Lightning's utility
     is_main_process = L.fabric.utilities.rank_zero.rank_zero_only.rank == 0
-    
+
     if is_main_process:
         if os.path.exists(exp_dir) and resume_path is None and args.test_only is None:
             os.rename(f"{exp_dir}", f"{exp_dir}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
@@ -236,20 +238,20 @@ def main():
         os.makedirs(exp_dir, exist_ok=True)
         # Create visualization directory
         os.makedirs(vis_dir, exist_ok=True)
-    
+
     # Update paths in config for all processes
     config['path']['visualization'] = vis_dir
     config['path']['log'] = os.path.join(exp_dir, 'logs')
-    
+
     # Create data module
     datamodule = create_datamodule(config)
-    
+
     # Create model
     model = build_model(config)
-    
+
     # Create loggers
     logger_list = []
-    
+
     # TensorBoard logger
     tb_logger = TensorBoardLogger(
         save_dir=config['path']['log'],
@@ -257,7 +259,7 @@ def main():
         default_hp_metric=False
     )
     logger_list.append(tb_logger)
-    
+
     # Weights & Biases logger
     wandb_config = config['logger'].get('wandb', {})
     if wandb_config.get('enable', False):
@@ -271,10 +273,10 @@ def main():
             notes=wandb_config.get('notes', None),
         )
         logger_list.append(wandb_logger)
-    
+
     # Create callbacks
     callbacks = create_callbacks(config)
-    
+
     # Create trainer
     trainer_kwargs = {
         'accelerator': config.get('accelerator', 'auto'),
@@ -290,7 +292,7 @@ def main():
         'deterministic': config['lightning'].get('deterministic', False),
         'strategy': "deepspeed_stage_1",
     }
-    
+
     # Add strategy for distributed training if specified
     if config['lightning'].get('strategy'):
         if config['lightning']['strategy'] == 'ddp_find_unused_parameters_true':
@@ -298,7 +300,7 @@ def main():
         else:
             strategy = config['lightning']['strategy']
         trainer_kwargs['strategy'] = strategy
-    
+
     # Add Lightning profiler if requested
     if config['lightning'].get('profiler'):
         from lightning.pytorch.profilers import SimpleProfiler, AdvancedProfiler
@@ -309,22 +311,61 @@ def main():
         elif profiler_type == 'advanced':
             trainer_kwargs['profiler'] = AdvancedProfiler()
             print("Using Advanced Profiler")
-    
+
     trainer = L.Trainer(**trainer_kwargs)
-    
+
     # Print configuration only on main process using Lightning's trainer
     rank_zero_info(f"Configuration: {config}")
-    
+
     # Test only or train + validate
     if args.test_only is not None:
-        trainer.test(model, datamodule=datamodule, ckpt_path=args.test_only)
+        print(f"Loading weights from {args.test_only} for testing...")
+
+        # 1. 加载文件 (CPU 加载以防显存波动)
+        checkpoint = torch.load(args.test_only, map_location='cpu')
+
+        # 2. 提取 state_dict (兼容 .ckpt 和 .pth)
+        if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        elif isinstance(checkpoint, dict) and 'params' in checkpoint:
+            state_dict = checkpoint['params']
+        else:
+            state_dict = checkpoint
+
+        # 3. 智能前缀适配 (核心修改)
+        # 目标：让所有 Key 都符合当前 LightningModule (DSRNetModel) 的结构，即必须以 "net_g." 开头
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            # 移除可能存在的 module. 前缀 (DataParallel 遗留)
+            if k.startswith('module.'):
+                k = k[7:]
+
+            # 如果权重自带 net_g. 前缀，直接用
+            if k.startswith('net_g.'):
+                new_state_dict[k] = v
+            # 如果权重没有 net_g. 前缀 (比如原始 FP32 权重或校准权重)，手动加上
+            else:
+                new_state_dict[f'net_g.{k}'] = v
+
+        # 4. 加载到模型 (strict=False 允许忽略一些无关参数，如 Loss 相关的遗留参数)
+        load_keys, missing_keys = model.load_state_dict(new_state_dict, strict=False)
+
+        # # 在 load_state_dict 之后加入：
+        # print("CHECK PARAM: a_l value =", model.net_g.encoders[0][0].a_l.data)
+
+        # 打印信息帮助调试
+        if len(missing_keys) > 0:
+            print(f"Warning: Missing keys (might be normal for loss/vgg params): {missing_keys} ...")
+
+        # 5. 开始测试 (ckpt_path=None 告诉 Lightning 不要重新加载文件，直接用内存里的 model)
+        trainer.test(model, datamodule=datamodule, ckpt_path=None)
     else:
         trainer.fit(model, datamodule=datamodule, ckpt_path=resume_path)
         if len(callbacks) > 0 and hasattr(callbacks[0], 'best_model_path'):
             best_model_path = callbacks[0].best_model_path
             if best_model_path:
                 trainer.test(model, datamodule=datamodule, ckpt_path=best_model_path)
-                
+
         # Close WandB logger to ensure logs are saved
         if wandb_config.get('enable', False):
             import wandb

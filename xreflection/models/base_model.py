@@ -44,10 +44,10 @@ class XMetricWrapper(Metric):
         target_img = tensor2img(target)
 
         metric_data = {'img': pred_img, 'img2': target_img}
-        
+
         # Here we call the user's custom metric calculation function
         metric_value = calculate_metric(metric_data, self.opt_)
-        
+
         self.total += metric_value
         self.count += 1
 
@@ -102,11 +102,12 @@ class BaseModel(L.LightningModule):
                 d_name = d_opt['name']
                 metrics_to_track = {m_name: XMetricWrapper(metric_opt=m_opt) for m_name, m_opt in metrics_conf.items()}
                 self.val_metrics[d_name] = MetricCollection(metrics_to_track)
-            
+
             # Setup a single metric collection for the true grand average calculation
-            total_metrics_to_track = {m_name: XMetricWrapper(metric_opt=m_opt) for m_name, m_opt in metrics_conf.items()}
+            total_metrics_to_track = {m_name: XMetricWrapper(metric_opt=m_opt) for m_name, m_opt in
+                                      metrics_conf.items()}
             self.total_val_metrics = MetricCollection(total_metrics_to_track)
-        
+
     def setup(self, stage: Optional[str] = None):
         """Setup module based on stage.
         
@@ -223,10 +224,10 @@ class BaseModel(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         pass
-    
+
     def on_train_epoch_end(self):
         self.trainer.train_dataloader.reset()
-        
+
     def testing(self, inp):
         if self.use_ema:
             model = self.ema_model
@@ -236,7 +237,7 @@ class BaseModel(L.LightningModule):
             x_cls_out, x_img_out = model(inp)
             output_clean, output_reflection = x_img_out[-1][:, :3, ...], x_img_out[-1][:, 3:, ...]
             self.output = [output_clean, output_reflection]
-    
+
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         """验证步骤。
         
@@ -250,7 +251,7 @@ class BaseModel(L.LightningModule):
         """
         # 获取当前验证数据集的名称
         dataset_name = self.val_dataset_names[dataloader_idx]
-        
+
         # 验证批次是否包含所需字段
         required_keys = ['input']
         for key in required_keys:
@@ -274,7 +275,7 @@ class BaseModel(L.LightningModule):
         # 处理图像用于指标计算和可视化
         clean_img = tensor2img(output_clean)
         reflection_img = tensor2img(output_reflection)
-        
+
         # 保存验证图像
         if self.opt['val'].get('save_img', False):
             self._save_images(clean_img, reflection_img, img_name, dataset_name)
@@ -305,15 +306,14 @@ class BaseModel(L.LightningModule):
                 # This assumes the dataset name in the dataloader opt matches the config.
                 if hasattr(loader.dataset, 'opt') and 'name' in loader.dataset.opt:
                     self.val_dataset_names[idx] = loader.dataset.opt['name']
-                else: 
+                else:
                     # Fallback to the order in the config file if name not in loader opt
                     self.val_dataset_names[idx] = self.opt['datasets']['val_datasets'][idx]['name']
-
 
     def on_validation_epoch_end(self):
         """Operations at the end of validation epoch."""
         # --- CORRECT: All processes must participate in .compute() ---
-        
+
         # 1. Compute per-dataset metrics on all ranks
         all_final_metrics = {}
         for dataset_name, metrics_collection in self.val_metrics.items():
@@ -349,13 +349,15 @@ class BaseModel(L.LightningModule):
             self.top_psnr_epochs.append((plain_avg_metrics['psnr'], self.current_epoch, self.global_step))
             self.top_psnr_epochs.sort(key=lambda x: (x[0], x[1]), reverse=True)
             self.top_psnr_epochs = self.top_psnr_epochs[:self.opt['val'].get('save_img_top_n', 5)]
-            rank_zero_info(f'\t # The Best Average PSNR: {self.top_psnr_epochs[0][0]:.4f} at Epoch {self.top_psnr_epochs[0][1]} Step {self.top_psnr_epochs[0][2]}')
-        
+            rank_zero_info(
+                f'\t # The Best Average PSNR: {self.top_psnr_epochs[0][0]:.4f} at Epoch {self.top_psnr_epochs[0][1]} Step {self.top_psnr_epochs[0][2]}')
+
         if 'ssim' in plain_avg_metrics:
             self.top_ssim_epochs.append((plain_avg_metrics['ssim'], self.current_epoch, self.global_step))
             self.top_ssim_epochs.sort(key=lambda x: (x[0], x[1]), reverse=True)
             self.top_ssim_epochs = self.top_ssim_epochs[:1]
-            rank_zero_info(f'\t # The Best Average SSIM: {self.top_ssim_epochs[0][0]:.4f} at Epoch {self.top_ssim_epochs[0][1]} Step {self.top_ssim_epochs[0][2]}\n')
+            rank_zero_info(
+                f'\t # The Best Average SSIM: {self.top_ssim_epochs[0][0]:.4f} at Epoch {self.top_ssim_epochs[0][1]} Step {self.top_ssim_epochs[0][2]}\n')
 
         # 4. Clean up old images
         self._delete_images_not_in_top_psnr()
@@ -377,7 +379,7 @@ class BaseModel(L.LightningModule):
             dict: Output dict with clean and reflection images.
         """
         return self.validation_step(batch, batch_idx, dataloader_idx)
-    
+
     def on_test_epoch_start(self):
         """Operations at the start of test epoch."""
         # This hook's sole responsibility is to
@@ -390,10 +392,10 @@ class BaseModel(L.LightningModule):
                 # This assumes the dataset name in the dataloader opt matches the config.
                 if hasattr(loader.dataset, 'opt') and 'name' in loader.dataset.opt:
                     self.val_dataset_names[idx] = loader.dataset.opt['name']
-                else: 
+                else:
                     # Fallback to the order in the config file if name not in loader opt
                     self.val_dataset_names[idx] = self.opt['datasets']['val_datasets'][idx]['name']
-    
+
     def on_test_epoch_end(self):
         """Operations at the end of test epoch."""
         self.on_validation_epoch_end()
@@ -468,23 +470,54 @@ class BaseModel(L.LightningModule):
         else:
             raise NotImplementedError(f'optimizer {optim_type} is not supported yet.')
         return optimizer
-    
+
     def _save_images(self, clean_img, reflection_img, img_name, dataset_name):
         try:
+            import cv2
+            import numpy as np
+
             save_dir = osp.join(self.opt['path']['visualization'], dataset_name, img_name)
             os.makedirs(save_dir, exist_ok=True)
-            if self.opt['val'].get('suffix'):
-                save_clean_img_path = osp.join(save_dir, f'{img_name}_clean_{self.opt["val"]["suffix"]}_epoch_{self.current_epoch}_step_{self.global_step}.png')
-                save_reflection_img_path = osp.join(save_dir, f'{img_name}_reflection_{self.opt["val"]["suffix"]}_epoch_{self.current_epoch}_step_{self.global_step}.png')
+
+            # 获取后缀
+            suffix = self.opt['val'].get('suffix')
+            if suffix:
+                name_suffix = f"_{suffix}"
             else:
-                save_clean_img_path = osp.join(save_dir, f'{img_name}_clean_{self.opt["name"]}_epoch_{self.current_epoch}_step_{self.global_step}.png')
-                save_reflection_img_path = osp.join(save_dir, f'{img_name}_reflection_{self.opt["name"]}_epoch_{self.current_epoch}_step_{self.global_step}.png')
-            # 保存图像
+                name_suffix = f"_{self.opt['name']}"
+
+            # 构造文件名
+            save_clean_img_path = osp.join(save_dir,
+                                           f'{img_name}_clean{name_suffix}_epoch_{self.current_epoch}_step_{self.global_step}.png')
+            save_reflection_img_path = osp.join(save_dir,
+                                                f'{img_name}_reflection{name_suffix}_epoch_{self.current_epoch}_step_{self.global_step}.png')
+
+            # ================= [修复核心] =================
+            def process_img_for_save(img):
+                # 1. 处理数据类型 (解决 WARN: Unsupported depth)
+                # 如果是浮点数 (0-1)，扩展到 0-255 并转 uint8
+                if img.dtype != np.uint8:
+                    if img.max() <= 1.0:
+                        img = (img * 255.0).clip(0, 255)
+                    img = img.astype(np.uint8)
+
+                # 2. 处理颜色空间 (解决色偏: RGB -> BGR)
+                # tensor2img 通常输出 RGB，cv2 保存需要 BGR
+                if img.ndim == 3 and img.shape[2] == 3:
+                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                return img
+
+            clean_img = process_img_for_save(clean_img)
+            reflection_img = process_img_for_save(reflection_img)
+            # =============================================
+
+            # 保存图像 (现在传入的是正确的 BGR uint8 数据)
             imwrite(clean_img, save_clean_img_path)
             imwrite(reflection_img, save_reflection_img_path)
+
         except Exception as e:
             rank_zero_warn(f"Error saving validation images: {str(e)}")
-    
+
     def _delete_images_not_in_top_psnr(self):
         # Use a set for efficient lookup of image identifiers to keep.
         # This includes the top N PSNR epochs and the current one.
@@ -507,7 +540,7 @@ class BaseModel(L.LightningModule):
                 file_path = osp.join(root, file_name)
                 if not osp.isfile(file_path):
                     continue
-                
+
                 match = re.search(r'epoch_(\d+)_step_(\d+)', file_name)
                 if match:
                     img_id = (int(match.group(1)), int(match.group(2)))
@@ -515,7 +548,7 @@ class BaseModel(L.LightningModule):
                     # If the image identifier is in our set, keep it.
                     if img_id in ids_to_keep:
                         continue
-                    
+
                     # Otherwise, delete the file.
                     try:
                         os.remove(file_path)

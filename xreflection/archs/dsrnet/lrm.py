@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 from collections import OrderedDict
 
+from xreflection.archs.quantize_arch import QuantConv2d, build_conv
+
 
 class LayerNormFunction(torch.autograd.Function):
 
@@ -50,11 +52,11 @@ class SimpleGate(nn.Module):
 
 
 class CABlock(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, channels, args=None):
         super(CABlock, self).__init__()
         self.ca = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, channels, 1)
+            build_conv(channels, channels, 1, args=args)
         )
 
     def forward(self, x):
@@ -96,17 +98,17 @@ class DualStreamBlock(nn.Module):
 
 
 class R2Block(nn.Module):
-    def __init__(self, c):
+    def __init__(self, c, args=None):
         super().__init__()
         self.block1 = DualStreamSeq(
             DualStreamBlock(
                 LayerNorm2d(c),
-                nn.Conv2d(c, c * 2, 1),
-                nn.Conv2d(c * 2, c * 2, 3, padding=1, groups=c * 2)
+                build_conv(c, c * 2, 1, args=args),  # 替换
+                build_conv(c * 2, c * 2, 3, padding=1, groups=c * 2, args=args)  # 替换
             ),
             DualStreamGate(),
-            DualStreamBlock(CABlock(c)),
-            DualStreamBlock(nn.Conv2d(c, c, 1))
+            DualStreamBlock(CABlock(c, args=args)),
+            DualStreamBlock(build_conv(c, c, 1, args=args))  # 替换
         )
 
         self.a_l = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
@@ -115,11 +117,11 @@ class R2Block(nn.Module):
         self.block2 = DualStreamSeq(
             DualStreamBlock(
                 LayerNorm2d(c),
-                nn.Conv2d(c, c * 2, 1)
+                build_conv(c, c * 2, 1, args=args)  # 替换
             ),
             DualStreamGate(),
             DualStreamBlock(
-                nn.Conv2d(c, c, 1)
+                build_conv(c, c, 1, args=args)  # 替换
             )
 
         )
@@ -136,22 +138,22 @@ class R2Block(nn.Module):
 
 
 class SinBlock(nn.Module):
-    def __init__(self, c):
+    def __init__(self, c, args=None):
         super().__init__()
         self.block1 = nn.Sequential(
             LayerNorm2d(c),
-            nn.Conv2d(c, c * 2, 1),
-            nn.Conv2d(c * 2, c * 2, 3, padding=1, groups=c * 2),
+            build_conv(c, c * 2, 1, args=args),  # 替换
+            build_conv(c * 2, c * 2, 3, padding=1, groups=c * 2, args=args),  # 替换
             SimpleGate(),
-            CABlock(c),
-            nn.Conv2d(c, c, 1)
+            CABlock(c, args=args),
+            build_conv(c, c, 1, args=args)  # 替换
         )
 
         self.block2 = nn.Sequential(
             LayerNorm2d(c),
-            nn.Conv2d(c, c * 2, 1),
+            build_conv(c, c * 2, 1, args=args),  # 替换
             SimpleGate(),
-            nn.Conv2d(c, c, 1)
+            build_conv(c, c, 1, args=args)  # 替换
         )
 
         self.a = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
@@ -164,16 +166,17 @@ class SinBlock(nn.Module):
         out = x_skip + x * self.b
         return out
 
+
 class LRM(nn.Module):
-    def __init__(self, in_channels=48, num_blocks=[2, 4]):
+    def __init__(self, in_channels=48, num_blocks=[2, 4], args=None):
         super().__init__()
         self.device = 'cuda'
         channel = in_channels * 2
-        self.intro = DualStreamBlock(nn.Conv2d(in_channels, channel, 1))
-        self.blocks_inter = DualStreamSeq(*[R2Block(channel) for _ in range(num_blocks[0])])
-        self.blocks_merge = nn.Sequential(*[SinBlock(channel * 2) for _ in range(num_blocks[1])])
+        self.intro = DualStreamBlock(build_conv(in_channels, channel, 1, args=args))
+        self.blocks_inter = DualStreamSeq(*[R2Block(channel, args=args) for _ in range(num_blocks[0])])
+        self.blocks_merge = nn.Sequential(*[SinBlock(channel * 2, args=args) for _ in range(num_blocks[1])])
         self.tail = nn.Sequential(
-            nn.Conv2d(channel * 2, 3, 3, padding=1),
+            build_conv(channel * 2, 3, 3, padding=1, args=args),
             nn.Tanh()
         )
 

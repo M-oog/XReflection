@@ -1,13 +1,13 @@
 # general settings
-name: train_sirs_dsrnet
+name: test_sirs_dsrnet
 is_train: true
 model_type: DSRNetModel  # Use Lightning module instead of vanilla model
 num_gpu: auto  # auto: can infer from your visible devices automatically
 manual_seed: 42
 
 # Command line options integrated into config
-test_only: false          # Whether to only test the model
-precision: '16-mixed'      # Precision for training (32-true, 16-mixed, bf16-mixed)
+test_only: true          # Whether to only test the model
+precision: '32-true'      # Precision for training (32-true, 16-mixed, bf16-mixed)
 accelerator: 'auto'       # Accelerator type (auto, gpu, cpu)
 val_check_interval: 0.25   # Validation check interval
 log_every_n_steps: 10     # Log every n steps
@@ -141,16 +141,16 @@ network_g:
   lrm_blk_nums: [2,4]
   # --- 新增量化配置 ---
   quant_config:
-    quantize: true           # 开启量化模式
+    quantize: false           # 开启量化模式
     quantize_a: 8.0
     quantize_w: 8.0
     quantizer: 'percentile'
     quantizer_w: 'omse'
-    wbc: false                # 关闭权重校正
+    wbc: false                # 开启权重校正
 
 # path
 path:
-  pretrain_network_g: /mnt/hugedisk/mxt/projects/XReflection/xreflection/experiments/dsrnet_quant_calib_percentile.pth
+  pretrain_network_g: ~
   param_key_g: params
   strict_load_g: true
   resume_state: ~

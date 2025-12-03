@@ -5,7 +5,7 @@
 # Written by Yuxuan Cai
 # --------------------------------------------------------
 
-import imp
+import importlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
