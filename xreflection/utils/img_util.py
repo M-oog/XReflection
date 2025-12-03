@@ -98,7 +98,7 @@ def tensor2img(image_tensor, imtype=np.uint8):
     image_numpy = np.clip(image_numpy, 0, 1)
     if image_numpy.shape[0] == 1:
         image_numpy = np.tile(image_numpy, (3, 1, 1))
-    image_numpy = (np.transpose(image_numpy, (1, 2, 0))) * 255.0
+    image_numpy = (np.transpose(image_numpy, (1, 2, 0))[..., ::-1]) * 255.0
     # image_numpy = image_numpy.astype(imtype)
     return image_numpy
 
